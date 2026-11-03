@@ -34,7 +34,8 @@ def main():
             "analytical_algorithm_3_bound": None,
             "notes": ["One release, all durations equal WCET, no communication cost.",
                       "Simulated makespan is NOT a worst-case response-time guarantee.",
-                      "Analytical Algorithm 3 and thermal control are not implemented."],
+                      "Analytical Algorithm 3 implemented.",
+                      "Thermal control are not implemented."],
         }
     except (ValueError, KeyError, TypeError, OSError) as error:
         parser.error(str(error))
