@@ -1,129 +1,195 @@
-from itertools import combinations
+"""Section IV, equations (6)--(18), of Zhang et al. (2026).
+
+Analysis for the canonical Algorithms 1/2 partition and priorities, one
+single-source/single-sink DAG, identical cores, non-preemptive nodes.
+Detailed intermediate quantities are available through analyze_algorithm_3.
+"""
+import math
+
+from dag_baseline import (assign_priorities, check_cores, divide_subgraphs,
+                          graham_bound, local_paths)
+
+
+def _width(nodes, dag):
+    """Maximum antichain via Dilworth: |V| minus maximum bipartite matching.
+
+    Edges use transitive reachability in the ORIGINAL DAG, including paths
+    through nodes outside this subset. Unlike subset enumeration this is
+    polynomial in the number of interference nodes.
+    """
+    nodes = sorted(nodes)
+    adjacent = {u: [v for v in nodes if u in dag.ancestors[v]] for u in nodes}
+    matched = {}
+
+    def augment(u, seen):
+        for v in adjacent[u]:
+            if v in seen:
+                continue
+            seen.add(v)
+            if v not in matched or augment(matched[v], seen):
+                matched[v] = u
+                return True
+        return False
+
+    return len(nodes) - sum(augment(u, set()) for u in nodes)
+
 
 def max_antichain_size(node_set, k, dag, C):
-    valid = [v for v in node_set if C[k].get(v, 0) > 0]
-    if not valid: return 0
-    
-    for size in range(len(valid), 0, -1):
-        for sub in combinations(valid, size):
-            indep = True
-            for i in range(len(sub)):
-                for j in range(i+1, len(sub)):
-                    u, v = sub[i], sub[j]
-                    if v in dag.ancestors.get(u, set()) or u in dag.ancestors.get(v, set()):
-                        indep = False
-                        break
-                if not indep: break
-            if indep:
-                return size
-    return 0
+    """Compatibility API; zero-residual nodes do not contribute parallelism."""
+    return _width({v for v in node_set if C[k].get(v, 0) > 0}, dag)
+
+
+def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
+                        *, observed_makespan=None):
+    """Return the reproduced candidate plus analysis and independent safety checks.
+
+    Inputs are validated against the baseline's canonical Algorithms 1 and 2.
+    Arbitrary partitions, tied priorities, multiple sources/sinks and truncated
+    path sets are deliberately rejected rather than producing an unsafe bound.
+    Local path enumeration still has the baseline's explicit 10,000-path limit.
+    This is an experimental reproduction: the residual/interference recurrence
+    has counterexamples. A separate Graham bound remains the safe model bound.
+    """
+    check_cores(cores)
+    if sum(not dag.pred[v] for v in dag.order) != 1 or sum(
+            not dag.succ[v] for v in dag.order) != 1:
+        raise ValueError("Algorithm 3 requires exactly one source and one sink")
+    _, expected_blocks, expected_tail = divide_subgraphs(dag)
+    if ([set(b) for b in blocks] != [set(b) for b in expected_blocks]
+            or list(tail) != expected_tail):
+        raise ValueError("Use the canonical Algorithm 1 blocks and tail")
+    if len(local_paths_list) != len(blocks):
+        raise ValueError("One complete path list is required for every block")
+    for block, paths in zip(blocks, local_paths_list):
+        if sorted(map(tuple, paths)) != sorted(local_paths(dag, block)):
+            raise ValueError("Local path lists must be complete and unmodified")
+    if priorities != assign_priorities(dag, blocks, tail):
+        raise ValueError("Use the canonical Algorithm 2 priorities")
+
+    descendants = {v: set() for v in dag.order}
+    for v in reversed(dag.order):
+        for u in dag.succ[v]:
+            descendants[v].add(u)
+            descendants[v].update(descendants[u])
+    all_nodes = set(dag.wcet)
+    concurrent = {v: all_nodes - dag.ancestors[v] - descendants[v] - {v}
+                  for v in dag.order}  # (6)
+    residual = dict(dag.wcet)
+    details = []
+    for index, block in enumerate(blocks):
+        members = set(block)
+        later = set(tail).union(*(set(b) for b in blocks[index + 1:]))
+        parallel = set().union(*(concurrent[v] for v in block)) & later  # (7)
+        scope = members | parallel
+        response, explicit, hp, lp, node_details = {}, {}, {}, {}, {}
+        width_cache = {}
+
+        def interference(nodes):
+            active = frozenset(v for v in nodes if residual[v] > 0)
+            if active not in width_cache:
+                width_cache[active] = _width(active, dag)
+            width = width_cache[active]
+            work = math.fsum(residual[v] for v in sorted(active))
+            return width, work, 0.0 if width < cores else work / cores
+
+        def select_lower(nodes):
+            return set(sorted(nodes, key=lambda v: (-residual[v], v))[:cores - 1])
+
+        for v in dag.order:
+            if v not in scope:
+                continue
+            hp[v], lp[v], explicit[v] = set(), set(), set()
+            # A reduced residual upper estimate does not prove that a node is
+            # actually running in every possible schedule. Retain start delays:
+            # applying the post-(11) started-node shortcut here is unsafe.
+            reduced = (0 < residual[v] < dag.wcet[v] and not math.isclose(
+                residual[v], dag.wcet[v], rel_tol=1e-12, abs_tol=0))
+            predecessor = max((response.get(p, 0) for p in dag.pred[v]), default=0)
+            if residual[v] == 0:
+                response[v] = residual[v]
+                width, work, delay = 0, 0.0, 0.0
+            else:
+                inherited = set().union(*(explicit.get(a, set())
+                                          for a in dag.ancestors[v]))
+                candidates = {u for u in scope & concurrent[v] - inherited
+                              if residual[u] > 0}
+                hp[v] = {u for u in candidates if priorities[u] > priorities[v]}  # (8)
+                lp[v] = candidates - hp[v]  # (9), priorities are unique
+                explicit[v] = hp[v] | select_lower(lp[v])  # (10)
+                width, work, delay = interference(explicit[v])
+                response[v] = predecessor + residual[v] + delay  # (11)
+            node_details[v] = {
+                "residual": residual[v], "residual_reduced": reduced,
+                "higher_priority_interference": sorted(hp[v]),
+                "lower_priority_interference": sorted(lp[v]),
+                "explicit_interference": sorted(explicit[v]),
+                "interference_width": width, "interference_workload": work,
+                "interference_delay": delay, "response_bound": response[v],
+            }
+
+        paths = []
+        for path in local_paths_list[index]:
+            high = set().union(*(hp[v] for v in path))  # (14)
+            low = set().union(*(lp[v] for v in path))  # (15)
+            path_explicit = high | select_lower(low)  # (16)
+            width, work, delay = interference(path_explicit)
+            path_work = math.fsum(residual[v] for v in path)
+            paths.append({"nodes": list(path), "residual_workload": path_work,
+                          "explicit_interference": sorted(path_explicit),
+                          "interference_width": width,
+                          "interference_workload": work,
+                          "interference_delay": delay,
+                          "response_bound": path_work + delay})  # (13)
+        block_bound = max(p["response_bound"] for p in paths)  # (17)
+        node_completion = max(response[v] for v in block)
+        next_residual = dict(residual)
+        for v in parallel:
+            next_residual[v] = min(dag.wcet[v], max(0.0, response[v] - node_completion))  # (12)
+            if math.isclose(next_residual[v], dag.wcet[v], rel_tol=1e-12, abs_tol=0):
+                next_residual[v] = dag.wcet[v]
+        for v in block:
+            next_residual[v] = 0.0
+        details.append({"index": index + 1, "nodes": list(block),
+                        "parallel_nodes": sorted(parallel),
+                        "residual_before": dict(residual),
+                        "node_analysis": node_details, "paths": paths,
+                        "response_bound": block_bound,
+                        "node_completion_bound": node_completion,
+                        "residual_after": dict(next_residual)})
+        residual = next_residual
+
+    tail_length = math.fsum(dag.wcet[v] for v in tail)
+    bound = math.fsum(b["response_bound"] for b in details) + tail_length  # (18)
+    if not math.isfinite(bound):
+        raise ValueError("Analysis overflow; rescale the WCETs")
+    lower_bound = max(dag.critical_path()[1], dag.workload() / cores)
+    issues = []
+    if bound + 1e-10 * max(1, lower_bound) < lower_bound:
+        issues.append("Candidate is below the workload/critical-path lower bound")
+    if observed_makespan is not None:
+        if not math.isfinite(observed_makespan) or observed_makespan <= 0:
+            raise ValueError("observed_makespan must be finite and positive")
+        if bound + 1e-10 * max(1, observed_makespan) < observed_makespan:
+            issues.append("Candidate is below the observed makespan: counterexample detected")
+    return {"bound": bound, "status": ("counterexample_detected" if issues
+                                       else "experimental_unverified"),
+            "is_proven_upper_bound": False,
+            "model_safe_bound": graham_bound(dag, cores),
+            "necessary_lower_bound": lower_bound, "sanity_issues": issues,
+            "observed_makespan": observed_makespan,
+            "concurrent_nodes": {v: sorted(concurrent[v]) for v in dag.order},
+            "blocks": details, "tail": list(tail), "tail_length": tail_length,
+            "assumptions": ["One single-source/single-sink DAG release",
+                            "Identical cores; no communication costs",
+                            "Non-preemptive nodes; canonical Algorithms 1/2 priorities",
+                            "Reproduced recurrence has known counterexamples; use model_safe_bound for guarantees",
+                            "Reduced residual estimates are not treated as proof of an already-running node"]}
+
 
 def calculate_algorithm_3_bound(dag, blocks, tail, local_paths_list, priorities, cores):
-    descendants = {v: set() for v in dag.wcet}
-    for v in reversed(dag.order):
-        descendants[v] = set(dag.succ[v])
-        for u in dag.succ[v]:
-            descendants[v].update(descendants[u])
-            
-    con = {}
-    all_nodes = set(dag.wcet.keys())
-    for v in dag.wcet:
-        con[v] = all_nodes - dag.ancestors.get(v, set()) - descendants[v] - {v}
-        
-    C = {1: {v: dag.wcet[v] for v in dag.wcet}}
-    R_node = {}
-    I_e = {}
-    I_hp_all = {}
-    I_lp_all = {}
-    
-    R_block_times = []
-    
-    for k_idx, block in enumerate(blocks):
-        k = k_idx + 1
-        B_k = set(block)
-        
-        later_blocks = set()
-        for l in range(k_idx + 1, len(blocks)):
-            later_blocks.update(blocks[l])
-        later_blocks.update(tail)
-        
-        para_B_k = set()
-        for v in B_k:
-            para_B_k.update(con[v])
-        para_B_k = para_B_k.intersection(later_blocks)
-        
-        I_e[k] = {}
-        R_node[k] = {}
-        I_hp_all[k] = {}
-        I_lp_all[k] = {}
-        
-        nodes_in_scope = [v for v in dag.order if v in B_k or v in para_B_k]
-        
-        for i in nodes_in_scope:
-            if C[k].get(i, 0) == 0:
-                R_node[k][i] = 0
-                I_e[k][i] = set()
-                I_hp_all[k][i] = set()
-                I_lp_all[k][i] = set()
-                continue
-                
-            anc_I_e = set()
-            for anc in dag.ancestors.get(i, set()):
-                if anc in I_e[k]:
-                    anc_I_e.update(I_e[k][anc])
-                    
-            I_hp, I_lp = set(), set()
-            for j in (B_k | para_B_k):
-                if j in con[i] and j not in anc_I_e and C[k].get(j, 0) > 0:
-                    if priorities[j] > priorities[i]:
-                        I_hp.add(j)
-                    elif priorities[j] < priorities[i]:
-                        I_lp.add(j)
-                        
-            I_hp_all[k][i] = I_hp
-            I_lp_all[k][i] = I_lp
-            
-            lp_sorted = sorted(list(I_lp), key=lambda j: C[k][j], reverse=True)
-            I_e[k][i] = I_hp.union(set(lp_sorted[:cores-1]))
-            
-            max_pred_R = max((R_node[k][p] for p in dag.pred[i] if p in R_node[k]), default=0)
-                    
-            if max_antichain_size(I_e[k][i], k, dag, C) <= cores - 1:
-                delay = 0
-            else:
-                delay = sum(C[k][j] for j in I_e[k][i]) / cores
-                
-            R_node[k][i] = max_pred_R + C[k][i] + delay
-            
-        R_paths = []
-        for path in local_paths_list[k_idx]:
-            path_I_hp, path_I_lp = set(), set()
-            path_W = sum(C[k][v] for v in path if C[k].get(v, 0) > 0)
-            
-            for v in path:
-                if v in I_hp_all[k]: path_I_hp.update(I_hp_all[k][v])
-                if v in I_lp_all[k]: path_I_lp.update(I_lp_all[k][v])
-                    
-            lp_sorted_path = sorted(list(path_I_lp), key=lambda j: C[k][j], reverse=True)
-            path_I_e = path_I_hp.union(set(lp_sorted_path[:cores-1]))
-            
-            if max_antichain_size(path_I_e, k, dag, C) <= cores - 1:
-                delay = 0
-            else:
-                delay = sum(C[k][j] for j in path_I_e) / cores
-                
-            R_paths.append(path_W + delay)
-            
-        R_k = max(R_paths) if R_paths else 0
-        R_block_times.append(R_k)
+    """Backward-compatible EXPERIMENTAL candidate API; not a safety guarantee.
 
-        if k < len(blocks):
-            C[k+1] = dict(C[k])
-            max_R_Bk = max((R_node[k][l] for l in B_k if l in R_node[k]), default=0)
-            for i in para_B_k:
-                C[k+1][i] = min(dag.wcet[i], max(0, R_node[k][i] - max_R_Bk))
-            for i in B_k:
-                C[k+1][i] = 0 
-                
-    tail_len = sum(dag.wcet[v] for v in tail)
-    return sum(R_block_times) + tail_len
+    Use analyze_algorithm_3 for diagnostics and its model_safe_bound field
+    when a guaranteed bound under the baseline model is needed.
+    """
+    return analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores)["bound"]

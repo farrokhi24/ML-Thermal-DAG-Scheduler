@@ -1,7 +1,7 @@
 """Small, dependency-free baseline for Sections II and III of the DAG paper.
 
-Node execution is non-preemptive. Analytical response-time Algorithm 3 and
-thermal control are deliberately separate future work.
+Node execution is non-preemptive. Analytical response-time Algorithm 3 lives
+in algorithm_3.py; synthetic thermal traces live in thermal_model.py.
 """
 
 from dataclasses import dataclass

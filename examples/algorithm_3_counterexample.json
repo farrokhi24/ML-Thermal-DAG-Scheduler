@@ -1,0 +1,64 @@
+{
+  "name": "Algorithm 3 reproduction counterexample",
+  "time_unit": "abstract time unit",
+  "wcet": {
+    "1": 1,
+    "2": 3,
+    "3": 2,
+    "4": 6,
+    "5": 6,
+    "6": 5,
+    "7": 3,
+    "8": 4
+  },
+  "edges": [
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      3
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      1,
+      7
+    ],
+    [
+      2,
+      4
+    ],
+    [
+      3,
+      5
+    ],
+    [
+      3,
+      6
+    ],
+    [
+      4,
+      7
+    ],
+    [
+      5,
+      8
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      7,
+      8
+    ]
+  ],
+  "cores": 2,
+  "expected_candidate": 17.0,
+  "expected_observed": 18,
+  "trial": 554
+}
