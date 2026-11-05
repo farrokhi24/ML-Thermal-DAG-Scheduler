@@ -66,7 +66,7 @@ class DAGGenerator:
             raise ValueError("connect_prob must be in [0, 1]")
         if max_wcet is not None and (not math.isfinite(max_wcet) or max_wcet <= 0):
             raise ValueError("max_wcet must be finite and positive")
-        if period is not None and (not math.isfinite(period) or period <= 0):
+        if period is not None and (isinstance(period, bool) or not math.isfinite(period) or period <= 0):
             raise ValueError("period must be finite and positive")
         if not isinstance(time_unit, str) or not time_unit.strip():
             raise ValueError("A time_unit label is required")

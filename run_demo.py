@@ -5,9 +5,9 @@ import json
 import math
 from pathlib import Path
 
-from algorithm_3 import analyze_algorithm_3
+from algorithm_3 import analyze_timing
 from dag_baseline import (DAG, assign_priorities, divide_subgraphs,
-                          graham_bound, local_paths, simulate)
+                          graham_bound, simulate)
 
 
 def main():
@@ -32,14 +32,15 @@ def main():
         joins, blocks, tail = divide_subgraphs(dag)
         priorities = assign_priorities(dag, blocks, tail)
         events = simulate(dag, priorities, args.cores)
-        paths = [local_paths(dag, block) for block in blocks]
         observed = max(event["finish"] for event in events)
-        analysis = analyze_algorithm_3(dag, blocks, tail, paths, priorities, args.cores,
-                                       observed_makespan=observed)
+        analysis = analyze_timing(dag, blocks, tail, priorities, args.cores,
+                                  observed_makespan=observed)
+        paths = analysis['local_paths']
         period, deadline = data.get("period"), data.get("deadline")
         if (period is None) != (deadline is None):
             raise ValueError("Supply both period and deadline, or neither")
-        if period is not None and (not math.isfinite(period) or period <= 0 or deadline != period):
+        if period is not None and (isinstance(period, bool) or isinstance(deadline, bool)
+                                   or not math.isfinite(period) or period <= 0 or deadline != period):
             raise ValueError("This baseline requires finite positive period and implicit deadline D=T")
         report = {
             "input": str(args.input.resolve()), "time_unit": data.get("time_unit", "unspecified"),
@@ -53,15 +54,17 @@ def main():
             "analytical_algorithm_3_bound": analysis["bound"],
             "algorithm_3_status": analysis["status"],
             "model_safe_bound": analysis["model_safe_bound"],
+            "certified_response_bound": analysis["certified_response_bound"],
+            "certified_response_method": analysis["certified_response_method"],
             "algorithm_3_details": analysis,
             "period": period, "deadline": deadline,
-            "isolated_release_bound_meets_deadline": (analysis["model_safe_bound"] <= deadline
+            "isolated_release_bound_meets_deadline": (analysis["certified_response_bound"] <= deadline
                                                      if deadline is not None else None),
             "generation": data.get("generation"), "seed": data.get("seed"),
             "notes": ["One release, all durations equal WCET, no communication cost.",
                       "Simulated makespan is NOT a worst-case response-time guarantee.",
                       "Algorithm 3 is experimental: known counterexamples prevent using it as a guarantee.",
-                      "Use model_safe_bound (Graham) for the deadline comparison.",
+                      "Deadline comparison uses the certified baseline bound, never the Algorithm 3 candidate.",
                       "Deadline comparison uses an isolated release; overlapping jobs are not simulated.",
                       "Synthetic thermal data is optional; thermal control is not implemented."],
         }

@@ -39,6 +39,22 @@ def max_antichain_size(node_set, k, dag, C):
     return _width({v for v in node_set if C[k].get(v, 0) > 0}, dag)
 
 
+def certified_response_bound(dag, cores):
+    """Sound bound for the unthrottled work-conserving baseline model.
+
+    One core executes exactly W work. If m >= DAG width, the union of running
+    and ready nodes (an antichain) always fits, so precedence alone determines
+    completion and the critical-path length is exact. Otherwise use Graham.
+    No observed schedule or experimental Algorithm 3 value is used here.
+    """
+    check_cores(cores)
+    if cores == 1:
+        return dag.workload(), 'serial_workload'
+    if cores >= _width(set(dag.wcet), dag):
+        return dag.critical_path()[1], 'sufficient_cores_critical_path'
+    return graham_bound(dag, cores), 'graham'
+
+
 def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
                         *, observed_makespan=None):
     """Return the reproduced candidate plus analysis and independent safety checks.
@@ -171,10 +187,12 @@ def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
             raise ValueError("observed_makespan must be finite and positive")
         if bound + 1e-10 * max(1, observed_makespan) < observed_makespan:
             issues.append("Candidate is below the observed makespan: counterexample detected")
+    certified, certified_method = certified_response_bound(dag, cores)
     return {"bound": bound, "status": ("counterexample_detected" if issues
                                        else "experimental_unverified"),
             "is_proven_upper_bound": False,
             "model_safe_bound": graham_bound(dag, cores),
+            "certified_response_bound": certified, "certified_response_method": certified_method,
             "necessary_lower_bound": lower_bound, "sanity_issues": issues,
             "observed_makespan": observed_makespan,
             "concurrent_nodes": {v: sorted(concurrent[v]) for v in dag.order},
@@ -193,3 +211,25 @@ def calculate_algorithm_3_bound(dag, blocks, tail, local_paths_list, priorities,
     when a guaranteed bound under the baseline model is needed.
     """
     return analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores)["bound"]
+
+
+def analyze_timing(dag, blocks, tail, priorities, cores, *, observed_makespan=None):
+    """Keep a certified baseline bound even if the experimental path set is too large."""
+    check_cores(cores)
+    try:
+        paths = [local_paths(dag, block) for block in blocks]
+    except ValueError as error:
+        if 'Local path limit exceeded' not in str(error):
+            raise
+        certified, method = certified_response_bound(dag, cores)
+        return {'bound': None, 'status': 'not_evaluated_path_limit', 'is_proven_upper_bound': False,
+                'model_safe_bound': graham_bound(dag, cores),
+                'certified_response_bound': certified, 'certified_response_method': method,
+                'necessary_lower_bound': max(dag.critical_path()[1], dag.workload() / cores),
+                'sanity_issues': [str(error)], 'observed_makespan': observed_makespan,
+                'local_paths': None, 'blocks': [], 'tail': list(tail),
+                'tail_length': sum(dag.wcet[v] for v in tail)}
+    result = analyze_algorithm_3(dag, blocks, tail, paths, priorities, cores,
+                                 observed_makespan=observed_makespan)
+    result['local_paths'] = paths
+    return result

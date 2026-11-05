@@ -14,6 +14,25 @@ def example():
 
 
 class BaselineTests(unittest.TestCase):
+    def test_dynamic_priority_assignment_matches_full_path_enumeration(self):
+        rng = random.Random(20261105)
+        for trial in range(80):
+            dag = DAG({v: (1 if trial % 3 == 0 else rng.randint(1, 8)) for v in range(10)},
+                      [(u, v) for u in range(10) for v in range(u + 1, 10) if rng.random() < .25])
+            _, blocks, tail = divide_subgraphs(dag)
+            expected, priority = {}, len(dag.wcet)
+            for block in blocks:
+                for path in local_paths(dag, block):
+                    for node in path:
+                        if node not in expected:
+                            expected[node] = priority
+                            priority -= 1
+            for node in dag.order:
+                if node in tail:
+                    expected[node] = priority
+                    priority -= 1
+            self.assertEqual(assign_priorities(dag, blocks, tail), expected)
+
     def test_paper_graph_metrics(self):
         dag = example()
         self.assertEqual(dag.workload(), 27)
@@ -69,6 +88,7 @@ class BaselineTests(unittest.TestCase):
 
     def test_invalid_inputs(self):
         for wcet, edges in [({}, []), ({1: -1}, []), ({1: float("nan")}, []),
+                            ({True: 1}, []), ({1: True}, []), ({1: 1e308, 2: 1e308}, []),
                             ({1: 1}, [(1, 2)]), ({1: 1, 2: 1}, [(1, 2), (2, 1)])]:
             with self.assertRaises(ValueError):
                 DAG(wcet, edges)

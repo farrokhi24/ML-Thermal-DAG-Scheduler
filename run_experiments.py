@@ -13,8 +13,8 @@ import json
 from pathlib import Path
 import platform
 
-from algorithm_3 import analyze_algorithm_3
-from dag_baseline import DAG, assign_priorities, check_cores, divide_subgraphs, local_paths, simulate
+from algorithm_3 import analyze_timing
+from dag_baseline import DAG, assign_priorities, check_cores, divide_subgraphs, simulate
 from dag_scheduler import DAGGenerator
 
 
@@ -49,11 +49,12 @@ def run_experiments(out, *, count=1000, seed=2026, cores=(2, 4), parallelism=8,
                 priorities = assign_priorities(dag, blocks, tail)
                 events = simulate(dag, priorities, core_count)
                 observed = max(e['finish'] for e in events)
-                analysis = analyze_algorithm_3(dag, blocks, tail, [local_paths(dag, b) for b in blocks],
-                                               priorities, core_count, observed_makespan=observed)
+                analysis = analyze_timing(dag, blocks, tail, priorities, core_count,
+                                          observed_makespan=observed)
                 record.update(status=analysis['status'], candidate=analysis['bound'],
                               observed=observed, graham=analysis['model_safe_bound'],
-                              candidate_over_graham=analysis['bound'] / analysis['model_safe_bound'])
+                              candidate_over_graham=(analysis['bound'] / analysis['model_safe_bound']
+                                                     if analysis['bound'] is not None else ''))
                 # Retain detailed reports for counterexamples and thermal samples.
                 if analysis['sanity_issues'] or index < thermal_count:
                     case.mkdir(parents=True, exist_ok=True)

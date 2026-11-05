@@ -36,6 +36,46 @@ def grid_topology(cores, columns=None):
     return positions, neighbors, columns
 
 
+class RCNetwork:
+    """Stateful exact RC plant shared by trace generation and closed-loop runs."""
+    def __init__(self, cores, *, ambient=45.0, resistance=.8, capacitance=3.0,
+                 coupling=0.0, columns=None, initial_temperature=None):
+        _positive('resistance', resistance)
+        _positive('capacitance', capacitance)
+        _positive('coupling', coupling, zero=True)
+        initial_temperature = ambient if initial_temperature is None else initial_temperature
+        if not all(math.isfinite(v) for v in [ambient, initial_temperature]):
+            raise ValueError('Temperatures must be finite')
+        self.positions, self.neighbors, self.columns = grid_topology(cores, columns)
+        self.cores, self.ambient = cores, ambient
+        conductance = np.eye(cores) / resistance
+        for c in range(cores):
+            conductance[c, c] += coupling * len(self.neighbors[c])
+            for d in self.neighbors[c]:
+                conductance[c, d] = -coupling
+        self.eigenvalues, self.eigenvectors = np.linalg.eigh(conductance / capacitance)
+        if not np.isfinite(self.eigenvalues).all() or np.any(self.eigenvalues <= 0):
+            raise ValueError('RC parameters are numerically ill-conditioned')
+        self.inverse = (self.eigenvectors / (self.eigenvalues * capacitance)) @ self.eigenvectors.T
+        self.state = np.full(cores, initial_temperature - ambient, dtype=float)
+
+    @property
+    def temperatures(self):
+        return self.state.copy() + self.ambient
+
+    def advance(self, power, seconds):
+        _positive('elapsed seconds', seconds, zero=True)
+        power = np.asarray(power, dtype=float)
+        if power.shape != (self.cores,) or not np.isfinite(power).all() or np.any(power < 0):
+            raise ValueError('Expected one finite nonnegative power per core')
+        equilibrium = self.inverse @ power
+        self.state = equilibrium + self.eigenvectors @ (
+            np.exp(-self.eigenvalues * seconds) * (self.eigenvectors.T @ (self.state - equilibrium)))
+        if not np.isfinite(self.state).all():
+            raise ValueError('RC state overflow')
+        return self.temperatures
+
+
 def load_schedule(path, cores=None):
     with Path(path).open(newline="") as stream:
         reader = csv.DictReader(stream)
@@ -156,15 +196,8 @@ def generate_thermal_trace(schedule_csv_path, output_csv_path,
         changes.sort(key=lambda item: (item[1] is not None, item[0]))
     boundaries = sorted(set(samples) | set(switches))
     sample_set = set(samples)
-    conductance = np.eye(count) / R
-    for c in range(count):
-        conductance[c, c] += coupling * len(neighbors[c])
-        for d in neighbors[c]:
-            conductance[c, d] = -coupling
-    eigenvalues, eigenvectors = np.linalg.eigh(conductance / C)
-    # Diagonalize once; equilibrium = G^-1 P and exact state transition exp(-G dt/C).
-    inverse = (eigenvectors / (eigenvalues * C)) @ eigenvectors.T
-    state = np.full(count, initial_temperature - T_amb, dtype=float)
+    plant = RCNetwork(count, ambient=T_amb, resistance=R, capacitance=C,
+                      coupling=coupling, columns=columns, initial_temperature=initial_temperature)
     active = [None] * count
     power = np.full(count, P_idle, dtype=float)
     sensor_rng = random.Random(seed ^ 0x5EED)
@@ -172,16 +205,14 @@ def generate_thermal_trace(schedule_csv_path, output_csv_path,
     for time in boundaries:
         elapsed = (time - previous) * seconds_per_unit
         if elapsed > 0:
-            equilibrium = inverse @ power
-            state = equilibrium + eigenvectors @ (np.exp(-eigenvalues * elapsed) *
-                                                   (eigenvectors.T @ (state - equilibrium)))
+            plant.advance(power, elapsed)
         for core, node in switches.get(time, []):
             active[core] = node
             power[core] = P_idle if node is None else powers_by_node[node]
         if time in sample_set:
             row = {"Time": time, "Time_Seconds": time * seconds_per_unit}
             for core in range(count):
-                latent = float(state[core] + T_amb)
+                latent = float(plant.temperatures[core])
                 row[f"Temp_Core_{core}"] = latent + sensor_rng.gauss(0, sensor_noise_std)
                 row[f"Latent_Temp_Core_{core}"] = latent
                 row[f"Power_Core_{core}"] = float(power[core])
