@@ -126,7 +126,9 @@ def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
                 width, work, delay = 0, 0.0, 0.0
             else:
                 inherited = set().union(*(explicit.get(a, set())
-                                          for a in dag.ancestors[v]))
+                                          for a in dag.ancestors[v] 
+                                          if node_details.get(a, {}).get('interference_delay', 0) > 0))
+                
                 candidates = {u for u in scope & concurrent[v] - inherited
                               if residual[u] > 0}
                 hp[v] = {u for u in candidates if priorities[u] > priorities[v]}  # (8)

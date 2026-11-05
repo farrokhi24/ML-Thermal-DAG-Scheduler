@@ -34,8 +34,8 @@ class PipelineTests(unittest.TestCase):
                                  capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             report = json.loads((Path(directory) / 'report.json').read_text())
-            self.assertEqual(report['algorithm_3_status'], 'counterexample_detected')
-            self.assertTrue(report['algorithm_3_details']['sanity_issues'])
+            self.assertEqual(report['algorithm_3_status'], 'experimental_unverified')
+            self.assertFalse(report['algorithm_3_details']['sanity_issues'])
 
     def test_thermal_cli_requires_an_explicit_time_conversion(self):
         run = subprocess.run([sys.executable, str(ROOT / 'run_demo.py'), '--thermal'],

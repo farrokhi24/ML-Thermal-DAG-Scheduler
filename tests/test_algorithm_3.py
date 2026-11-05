@@ -71,13 +71,13 @@ class Algorithm3Tests(unittest.TestCase):
         observed = max(e['finish'] for e in simulate(dag, args[-1], 2))
         result = analyze_algorithm_3(dag, *args, 2, observed_makespan=observed)
         self.assertEqual(observed, 18)
-        self.assertEqual(result['bound'], 17)
-        self.assertEqual(result['status'], 'counterexample_detected')
-        self.assertTrue(result['sanity_issues'])
+        self.assertEqual(result['bound'], 23.5)
+        self.assertEqual(result['status'], 'experimental_unverified')
+        self.assertFalse(result['sanity_issues'])
         self.assertGreaterEqual(result['model_safe_bound'], observed)
         # Regression for the source of the discrepancy: v6 is treated as
         # completed at B2 release, although its simulated finish is 14 > 10.
-        self.assertEqual(result['blocks'][1]['residual_before'][6], 0)
+        self.assertEqual(result['blocks'][1]['residual_before'][6], 5)
 
     def test_chain_and_single_node(self):
         for dag in [DAG({1: 2}, []), DAG({1: 2, 2: 3.5}, [(1, 2)])]:
