@@ -25,7 +25,7 @@ def prepare(dag):
 def run_system(data, out, *, cores=2, seconds_per_unit, dt=1.0, policy='predictive',
                seed=42, training_seed=9000, training_graphs=3, training_workload=200.0,
                limit=55.0, coupling=.15, mu=None, columns=None, **plant_parameters):
-    if policy not in ['none', 'reactive', 'predictive']:
+    if policy not in ['none', 'reactive', 'predictive', 'budget']:
         raise ValueError('Unsupported comparison policy')
     if isinstance(training_graphs, bool) or not isinstance(training_graphs, int) or training_graphs < 1:
         raise ValueError('training_graphs must be a positive integer')
@@ -148,8 +148,11 @@ def main():
     parser.add_argument('--cores', type=int, default=2)
     parser.add_argument('--seconds-per-unit', type=float, required=True)
     parser.add_argument('--dt', type=float, default=1.0)
-    parser.add_argument('--policy', choices=['none', 'reactive', 'predictive'], default='predictive')
+    parser.add_argument('--policy', choices=['none', 'reactive', 'predictive', 'budget'], default='predictive')
     parser.add_argument('--limit', type=float, default=55)
+    parser.add_argument('--hysteresis', type=float, default=2)
+    parser.add_argument('--margin', type=float, default=.5)
+    parser.add_argument('--levels', type=float, nargs='+', default=[1, .75, .5, .25, 0])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--training-seed', type=int, default=9000)
     parser.add_argument('--training-graphs', type=int, default=3)
@@ -163,7 +166,8 @@ def main():
                             seconds_per_unit=args.seconds_per_unit, dt=args.dt, policy=args.policy,
                             seed=args.seed, training_seed=args.training_seed, training_graphs=args.training_graphs,
                             training_workload=args.training_workload, limit=args.limit,
-                            coupling=args.coupling, columns=args.columns, mu=args.mu)
+                            coupling=args.coupling, columns=args.columns, mu=args.mu,
+                            hysteresis=args.hysteresis, margin=args.margin, levels=tuple(args.levels))
     except (ValueError, TypeError, OSError, KeyError) as error:
         parser.error(str(error))
     print(json.dumps({'baseline': scores['baseline'], 'controlled': scores['controlled'],

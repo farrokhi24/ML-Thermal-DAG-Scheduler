@@ -32,15 +32,17 @@ class ThrottleController:
         self.levels = tuple(levels)
         self.emergency_cooling = False
         self.progress_fallbacks = 0
+        self.last_reason = 'full_activity'
 
     def decide(self, temperatures, occupied, mode, predictor=None):
         temperatures = np.asarray(temperatures, dtype=float)
         occupied = np.asarray(occupied, dtype=bool)
-        if mode not in ['none', 'reactive', 'predictive']:
+        if mode not in ['none', 'reactive', 'predictive', 'budget']:
             raise ValueError('Unknown controller mode')
         if temperatures.shape != (self.cores,) or occupied.shape != (self.cores,) or not np.isfinite(temperatures).all():
             raise ValueError('Invalid sensor vector')
         duty = np.ones(self.cores)
+        self.last_reason = 'full_activity'
         if mode == 'none':
             return duty
         # Global measured-temperature guard: cooling every core gives a finite,
@@ -50,8 +52,24 @@ class ThrottleController:
         if temperatures.max() <= self.limit - self.hysteresis:
             self.emergency_cooling = False
         if self.emergency_cooling:
+            self.last_reason = 'measured_global_cooldown'
             duty[occupied] = 0
             return duty
+        if mode == 'budget':
+            if predictor is None:
+                raise ValueError('Budget control requires a trained predictor')
+            # Ref [5] (TPDS 2015), Section 4.2/Fig. 10: for k=1,
+            # predicted emergency requests half activity; measured emergency
+            # requests full throttling. Keep the shared global measured guard
+            # as an explicit project adaptation to the coupled DAG platform.
+            forecast = predictor.predict(predictor.features(temperatures, np.zeros(self.cores)))
+            requested = .5  # one-step budget split, not ANN action search
+            allowed = [level for level in self.levels if 0 < level <= requested]
+            if not allowed:
+                raise ValueError('Budget policy requires a positive duty level <= 0.5')
+            duty[occupied & (forecast >= self.limit - self.margin)] = max(allowed)
+            if np.any(duty[occupied] < 1):
+                self.last_reason = 'one_step_power_budget'
         if mode == 'predictive':
             if predictor is None:
                 raise ValueError('Predictive control requires a trained predictor')
@@ -65,6 +83,8 @@ class ThrottleController:
                         break
                 else:
                     duty[core] = 0
+            if np.any(duty[occupied] < 1):
+                self.last_reason = 'discrete_forecast_search'
             # An inaccurate forecast must not stall a cool platform forever.
             # At least one occupied core makes progress outside emergency cooling.
             if occupied.any() and not np.any(duty[occupied] > 0):
@@ -72,6 +92,7 @@ class ThrottleController:
                 core = min(eligible, key=lambda c: (temperatures[c], c))
                 duty[core] = min(level for level in self.levels if level > 0)
                 self.progress_fallbacks += 1
+                self.last_reason = 'minimum_progress_fallback'
         return duty
 
 
@@ -118,6 +139,7 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
                          columns=None, initial_temperature=None, idle_power=2.0,
                          power_min=10.0, power_max=20.0, node_powers=None,
                          limit=55.0, hysteresis=2.0, margin=.5,
+                         levels=(1.0, .75, .5, .25, 0.0),
                          max_time=None, max_steps=200000):
     check_cores(cores)
     for name, value in [('seconds_per_unit', seconds_per_unit), ('dt', dt)]:
@@ -126,7 +148,7 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
         _positive(name, value, zero=True)
     if power_min > power_max or power_min < idle_power:
         raise ValueError('Require idle_power <= power_min <= power_max')
-    if policy not in ['none', 'reactive', 'predictive', 'random']:
+    if policy not in ['none', 'reactive', 'predictive', 'budget', 'random']:
         raise ValueError('Unknown thermal policy')
     if set(priorities) != set(dag.wcet) or not all(math.isfinite(p) for p in priorities.values()):
         raise ValueError('Every DAG node requires a finite priority')
@@ -136,17 +158,19 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
         raise ValueError('max_steps must be a positive integer')
     plant = RCNetwork(cores, ambient=ambient, resistance=resistance, capacitance=capacitance,
                       coupling=coupling, columns=columns, initial_temperature=initial_temperature)
-    if policy in ['reactive', 'predictive'] and limit - hysteresis <= ambient + resistance * idle_power:
+    if policy in ['reactive', 'predictive', 'budget'] and limit - hysteresis <= ambient + resistance * idle_power:
         raise ValueError('Cooling threshold is below the idle equilibrium; recovery is impossible')
     model = None if predictor is None else ANNLMSPredictor.from_dict(predictor.to_dict())
-    if policy == 'predictive' and model is None:
+    if policy in ['predictive', 'budget'] and model is None:
         raise ValueError('Predictive control requires a trained predictor')
     if model is not None and (model.cores != cores or model.columns != plant.columns):
         raise ValueError('Predictor topology must match the physical core grid')
     if model is not None and model.horizon_seconds is not None and not math.isclose(
             model.horizon_seconds, dt * seconds_per_unit, rel_tol=1e-10, abs_tol=0):
         raise ValueError('Predictor horizon must match the physical sensing interval')
-    controller = ThrottleController(cores, limit, hysteresis, margin)
+    controller = ThrottleController(cores, limit, hysteresis, margin, levels)
+    if policy == 'budget' and not any(0 < level <= .5 for level in levels):
+        raise ValueError('Budget policy requires a positive duty level <= 0.5')
     power_rng, action_rng = random.Random(seed), random.Random(seed ^ 0xC011)
     powers = ({v: power_rng.uniform(power_min, power_max) for v in sorted(dag.wcet)}
               if node_powers is None else {int(v): float(p) for v, p in node_powers.items()})
@@ -155,7 +179,8 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
     controlled_bound = (guarded_response_bound(
         dag.workload(), dt, seconds_per_unit, ambient, resistance, capacitance, idle_power,
         max(powers.values()), ambient if initial_temperature is None else initial_temperature,
-        limit, hysteresis, nodes=len(dag.wcet)) if policy in ['reactive', 'predictive'] else None)
+        limit, hysteresis, nodes=len(dag.wcet),
+        minimum_duty=min(level for level in levels if level > 0)) if policy in ['reactive', 'predictive', 'budget'] else None)
     max_time = (max(100.0, controlled_bound if controlled_bound is not None else dag.workload() * 100)
                 if max_time is None else max_time)
     _positive('max_time', max_time)
@@ -228,7 +253,7 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
             predicted = model.predict(x)
             pending = (x.copy(), predicted.copy(), time, target_time)
         records.append(sensor_row(duty, predicted))
-        decisions.append({'time': time, **{f'duty_core_{c}': float(duty[c]) for c in range(cores)}})
+        decisions.append({'time': time, 'reason': controller.last_reason if policy != 'random' else 'calibration', **{f'duty_core_{c}': float(duty[c]) for c in range(cores)}})
         while time < target_time and len(completed) < len(dag.wcet):
             finishes = [time + remaining[v] / duty[c] for c, v in running.items() if duty[c] > 0]
             boundary = min([target_time] + finishes)
@@ -267,9 +292,18 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
     errors = (prediction_metrics([p['actual'] for p in predictions], [p['prediction'] for p in predictions])
               if predictions else None)
     temperatures = frame[[f'Temp_Core_{c}' for c in range(cores)]].to_numpy()
+    sample_seconds = np.diff(frame.Time_Seconds.to_numpy())
+    # Left-sample estimates, not claims about continuous-time peaks/crossings.
+    exposure = float(np.sum((temperatures[:-1] > limit) * sample_seconds[:, None]))
+    excess = float(np.sum(np.maximum(temperatures[:-1] - limit, 0) * sample_seconds[:, None]))
+    mean_temperature = float(np.sum(temperatures[:-1] * sample_seconds[:, None]) /
+                             (sample_seconds.sum() * cores))
     metrics = {'policy': policy, 'makespan': time, 'energy_joules': energy,
                'peak_sensor_temperature_celsius': float(temperatures.max()),
                'peak_event_temperature_celsius': event_peak,
+               'sampled_violation_core_seconds': exposure,
+               'sampled_excess_degree_core_seconds': excess,
+               'mean_temperature_left_sample_celsius': mean_temperature,
                'sensor_readings_above_limit': int(np.sum(temperatures > limit)),
                'throttled_core_seconds': throttled_core_seconds,
                'prediction': errors, 'lms_updates': 0 if model is None else model.updates,
@@ -277,7 +311,10 @@ def simulate_thermal_dag(dag, priorities, cores, *, seconds_per_unit, dt=1.0,
                'conservative_controlled_response_bound': controlled_bound,
                'progress_fallbacks': controller.progress_fallbacks,
                'hard_temperature_guarantee': False,
-               'timing_bound_applicable': policy == 'none'}
+               'timing_bound_applicable': policy == 'none',
+               'controller_config': {'limit': limit, 'hysteresis': hysteresis, 'margin': margin,
+                                     'duty_levels': list(levels), 'budget_prediction_steps': 1},
+               'thermal_metric_sampling': 'left-endpoint sensor estimates; event peak not continuous maximum'}
     return {'schedule': pd.DataFrame(list(events.values())), 'trace': frame,
             'decisions': pd.DataFrame(decisions), 'predictions': pd.DataFrame(predictions),
             'metrics': metrics, 'node_powers': powers, 'model': model,

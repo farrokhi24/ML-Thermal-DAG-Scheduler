@@ -37,8 +37,10 @@ class Algorithm3Tests(unittest.TestCase):
         events = simulate(dag, priorities, 2)
         observed = max(e['finish'] for e in events)
         analysis = analyze_timing(dag, blocks, tail, priorities, 2, observed_makespan=observed)
-        self.assertEqual(analysis['status'], 'not_evaluated_path_limit')
-        self.assertIsNone(analysis['bound'])
+        self.assertEqual(analysis['status'], 'experimental_unverified')
+        self.assertIsNotNone(analysis['bound'])
+        self.assertGreater(analysis['blocks'][0]['path_statistics']['complete_path_count'], 10000)
+        self.assertLess(analysis['blocks'][0]['path_statistics']['retained_states'], 200000)
         self.assertGreaterEqual(analysis['certified_response_bound'], observed)
 
     def test_certified_special_cases_do_not_rely_on_the_paper_candidate(self):
@@ -130,3 +132,28 @@ class Algorithm3Tests(unittest.TestCase):
         result = analyze_algorithm_3(dag, *prepare(dag), 1)
         self.assertAlmostEqual(result['bound'], dag.workload())
         self.assertFalse(result['blocks'][1]['node_analysis'][7]['residual_reduced'])
+
+
+class CompactAnalysisTests(unittest.TestCase):
+    def test_compact_matches_exhaustive_path_oracle(self):
+        from dag_scheduler import DAGGenerator
+        for seed in range(30):
+            wcet, edges = DAGGenerator(seed=seed, min_depth=4, max_depth=6,
+                                      max_parallelism=4).generate_dag()
+            dag = DAG(wcet, edges)
+            blocks, tail, paths, priorities = prepare(dag)
+            for cores in [1, 2, 4]:
+                exhaustive = analyze_algorithm_3(dag, blocks, tail, paths, priorities, cores)
+                compact = analyze_timing(dag, blocks, tail, priorities, cores)
+                self.assertAlmostEqual(compact['bound'], exhaustive['bound'])
+                for a, b in zip(compact['blocks'], exhaustive['blocks']):
+                    self.assertAlmostEqual(a['response_bound'], b['response_bound'])
+                    self.assertEqual(a['residual_after'], b['residual_after'])
+
+    def test_state_budget_is_explicit_and_preserves_certified_bound(self):
+        dag = load('paper_12_nodes.json')
+        blocks, tail, _, priorities = prepare(dag)
+        result = analyze_timing(dag, blocks, tail, priorities, 2, max_states=1)
+        self.assertEqual(result['status'], 'not_evaluated_state_budget')
+        self.assertIsNone(result['bound'])
+        self.assertEqual(result['certified_response_bound'], 20.5)

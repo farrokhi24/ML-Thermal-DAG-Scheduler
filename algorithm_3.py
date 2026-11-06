@@ -55,14 +55,57 @@ def certified_response_bound(dag, cores):
     return graham_bound(dag, cores), 'graham'
 
 
+
+class AnalysisStateLimit(ValueError):
+    """Explicit resource limit on distinct interference states, not path count."""
+
+
+def compact_path_states(dag, block, hp, lp, residual, max_states=200000):
+    """Exact DP for (13)--(17) without enumerating all complete paths.
+
+    At the same ending node, paths with equal unions of higher/lower priority
+    interference have identical future interference scores. Retain only their
+    largest residual path workload. A representative path is kept for auditing.
+    Distinct interference signatures can still grow exponentially; report that
+    resource limit explicitly instead of approximating or dropping cases.
+    """
+    if isinstance(max_states, bool) or not isinstance(max_states, int) or max_states < 1:
+        raise ValueError('max_states must be a positive integer')
+    members, states, counts = set(block), {}, {}
+    retained = 0
+    for v in dag.order:
+        if v not in members:
+            continue
+        predecessors = sorted(dag.pred[v] & members)
+        counts[v] = sum(counts[u] for u in predecessors) if predecessors else 1
+        current = {}
+        parents = ((signature, work, path) for u in predecessors
+                   for signature, (work, path) in states[u].items()) if predecessors else [( (frozenset(), frozenset()), 0.0, ())]
+        for (high, low), work, path in parents:
+            signature = (high | frozenset(hp[v]), low | frozenset(lp[v]))
+            candidate = (work + residual[v], path + (v,))
+            previous = current.get(signature)
+            if previous is None or (-candidate[0], candidate[1]) < (-previous[0], previous[1]):
+                current[signature] = candidate
+                if len(current) + retained > max_states:
+                    raise AnalysisStateLimit(f'Interference-state budget exceeded ({max_states})')
+        states[v] = current
+        retained += len(current)
+    sinks = [v for v in dag.order if v in members and not (dag.succ[v] & members)]
+    terminal = [(signature, work, path) for v in sinks
+                for signature, (work, path) in states[v].items()]
+    return terminal, {'complete_path_count': sum(counts[v] for v in sinks),
+                      'retained_states': retained, 'terminal_states': len(terminal)}
+
+
 def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
-                        *, observed_makespan=None):
+                        *, observed_makespan=None, max_states=200000):
     """Return the reproduced candidate plus analysis and independent safety checks.
 
     Inputs are validated against the baseline's canonical Algorithms 1 and 2.
     Arbitrary partitions, tied priorities, multiple sources/sinks and truncated
     path sets are deliberately rejected rather than producing an unsafe bound.
-    Local path enumeration still has the baseline's explicit 10,000-path limit.
+    With no supplied lists, exact compact interference states replace enumeration.
     This is an experimental reproduction: the residual/interference recurrence
     has counterexamples. A separate Graham bound remains the safe model bound.
     """
@@ -74,11 +117,12 @@ def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
     if ([set(b) for b in blocks] != [set(b) for b in expected_blocks]
             or list(tail) != expected_tail):
         raise ValueError("Use the canonical Algorithm 1 blocks and tail")
-    if len(local_paths_list) != len(blocks):
-        raise ValueError("One complete path list is required for every block")
-    for block, paths in zip(blocks, local_paths_list):
-        if sorted(map(tuple, paths)) != sorted(local_paths(dag, block)):
-            raise ValueError("Local path lists must be complete and unmodified")
+    if local_paths_list is not None:
+        if len(local_paths_list) != len(blocks):
+            raise ValueError("One complete path list is required for every block")
+        for block, paths in zip(blocks, local_paths_list):
+            if sorted(map(tuple, paths)) != sorted(local_paths(dag, block)):
+                raise ValueError("Local path lists must be complete and unmodified")
     if priorities != assign_priorities(dag, blocks, tail):
         raise ValueError("Use the canonical Algorithm 2 priorities")
 
@@ -146,18 +190,24 @@ def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
             }
 
         paths = []
-        for path in local_paths_list[index]:
-            high = set().union(*(hp[v] for v in path))  # (14)
-            low = set().union(*(lp[v] for v in path))  # (15)
-            path_explicit = high | select_lower(low)  # (16)
+        if local_paths_list is None:
+            terminal, path_stats = compact_path_states(dag, block, hp, lp, residual, max_states)
+        else:
+            terminal = [( (set().union(*(hp[v] for v in path)),
+                           set().union(*(lp[v] for v in path))),
+                          math.fsum(residual[v] for v in path), tuple(path))
+                         for path in local_paths_list[index]]
+            path_stats = {'complete_path_count': len(terminal), 'terminal_states': len(terminal),
+                          'retained_states': None}
+        for (high, low), path_work, path in terminal:
+            path_explicit = set(high) | select_lower(low)
             width, work, delay = interference(path_explicit)
-            path_work = math.fsum(residual[v] for v in path)
             paths.append({"nodes": list(path), "residual_workload": path_work,
                           "explicit_interference": sorted(path_explicit),
                           "interference_width": width,
                           "interference_workload": work,
                           "interference_delay": delay,
-                          "response_bound": path_work + delay})  # (13)
+                          "response_bound": path_work + delay})
         block_bound = max(p["response_bound"] for p in paths)  # (17)
         node_completion = max(response[v] for v in block)
         next_residual = dict(residual)
@@ -171,6 +221,7 @@ def analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores,
                         "parallel_nodes": sorted(parallel),
                         "residual_before": dict(residual),
                         "node_analysis": node_details, "paths": paths,
+                        "path_statistics": path_stats,
                         "response_bound": block_bound,
                         "node_completion_bound": node_completion,
                         "residual_after": dict(next_residual)})
@@ -215,23 +266,26 @@ def calculate_algorithm_3_bound(dag, blocks, tail, local_paths_list, priorities,
     return analyze_algorithm_3(dag, blocks, tail, local_paths_list, priorities, cores)["bound"]
 
 
-def analyze_timing(dag, blocks, tail, priorities, cores, *, observed_makespan=None):
-    """Keep a certified baseline bound even if the experimental path set is too large."""
+def analyze_timing(dag, blocks, tail, priorities, cores, *, observed_makespan=None,
+                   max_states=200000):
+    """Exact compact path evaluation of the experimental recurrence.
+
+    No 10,000-path cap. If interference STATE memory exceeds max_states, keep
+    the independent certified bound and report that the candidate is unevaluated.
+    """
     check_cores(cores)
     try:
-        paths = [local_paths(dag, block) for block in blocks]
-    except ValueError as error:
-        if 'Local path limit exceeded' not in str(error):
-            raise
+        result = analyze_algorithm_3(dag, blocks, tail, None, priorities, cores,
+                                    observed_makespan=observed_makespan, max_states=max_states)
+    except AnalysisStateLimit as error:
         certified, method = certified_response_bound(dag, cores)
-        return {'bound': None, 'status': 'not_evaluated_path_limit', 'is_proven_upper_bound': False,
+        return {'bound': None, 'status': 'not_evaluated_state_budget', 'is_proven_upper_bound': False,
                 'model_safe_bound': graham_bound(dag, cores),
                 'certified_response_bound': certified, 'certified_response_method': method,
                 'necessary_lower_bound': max(dag.critical_path()[1], dag.workload() / cores),
                 'sanity_issues': [str(error)], 'observed_makespan': observed_makespan,
                 'local_paths': None, 'blocks': [], 'tail': list(tail),
-                'tail_length': sum(dag.wcet[v] for v in tail)}
-    result = analyze_algorithm_3(dag, blocks, tail, paths, priorities, cores,
-                                 observed_makespan=observed_makespan)
-    result['local_paths'] = paths
+                'tail_length': sum(dag.wcet[v] for v in tail), 'path_evaluation': 'compact_interference_dp'}
+    result['local_paths'] = None  # Full lists are intentionally not materialized.
+    result['path_evaluation'] = 'compact_interference_dp'
     return result
